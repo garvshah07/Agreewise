@@ -1,4 +1,3 @@
-import React from 'react'
 import { RouterProvider, createMemoryRouter } from 'react-router-dom';
 import './App.css'
 import Home from './component/Home';

@@ -1,563 +1,305 @@
 import { useEffect, useRef, useState } from 'react'
-import { Groq } from 'groq-sdk'
-import { GlobalWorkerOptions, getDocument } from 'pdfjs-dist'
-import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import Navigation from './Navigation'
+import SourcePanel from './SourcePanel'
+import AuditResults from './AuditResults'
+import HistoryList from './HistoryList'
+import { extractDocumentText, extractPageText, extractPdfUrl, getPdfUrl } from '../utils/policy'
+import { extractAuditText, requestAudit } from '../utils/audit'
+import { loadHistory, saveHistory } from '../utils/history'
 
-GlobalWorkerOptions.workerSrc = pdfWorker
+const extensionApi = typeof globalThis.chrome === 'undefined' ? null : globalThis.chrome
 
-const HISTORY_STORAGE_KEY = 'agreewise_audit_history'
-const TAB_OPTIONS = ['Scan', 'Upload Document', 'History']
-
-function extractPageText() {
-  const blockedTags = ['NAV', 'HEADER', 'FOOTER', 'ASIDE']
-  const mainRoot =
-    document.querySelector('main') ||
-    document.querySelector('article') ||
-    document.querySelector('[role="main"]') ||
-    document.body
-
-  const textParts = Array.from(
-    mainRoot.querySelectorAll('h1, h2, h3, h4, h5, h6, p, li')
+function Header({ onRefresh, disabled }) {
+  return (
+    <header className='flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3'>
+      <div className='flex items-center gap-2'>
+        <span className='flex h-8 w-8 items-center justify-center rounded-lg bg-[#17212b] text-sm font-black text-[#f2c36c]'>A</span>
+        <div>
+          <h1 className='text-sm font-bold tracking-tight text-[#17212b]'>AgreeWise</h1>
+          <p className='text-[10px] text-slate-500'>Policy clarity in seconds</p>
+        </div>
+      </div>
+      <div className='flex items-center gap-3'>
+        <span className='text-[10px] font-bold uppercase tracking-[0.14em] text-[#a06a21]'>TL;DR</span>
+        <button
+          type='button'
+          onClick={onRefresh}
+          disabled={disabled}
+          aria-label='Start a new policy review'
+          title='Start a new policy review'
+          className='flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-lg text-slate-600 transition hover:border-slate-400 hover:bg-slate-50 hover:text-[#17212b] disabled:cursor-not-allowed disabled:opacity-50'
+        >
+          ↻
+        </button>
+      </div>
+    </header>
   )
-    .filter((element) => {
-      if (blockedTags.includes(element.tagName)) {
-        return false
-      }
-
-      return !blockedTags.includes(element.closest('nav, header, footer, aside')?.tagName)
-    })
-    .map((element) => element.innerText.trim())
-    .filter(Boolean)
-
-  return textParts.join('\n\n')
 }
 
-async function readFileAsText(file) {
-  return file.text()
+function StatusMessage({ children, tone = 'neutral' }) {
+  const colors = tone === 'error'
+    ? 'border-rose-200 bg-rose-50 text-rose-800'
+    : 'border-amber-200 bg-amber-50 text-amber-900'
+
+  return <div className={`border-l-4 px-3 py-2 text-sm ${colors}`}>{children}</div>
 }
 
-async function readFileAsArrayBuffer(file) {
-  return file.arrayBuffer()
-}
-
-async function extractPdfText(file) {
-  const pdfData = await readFileAsArrayBuffer(file)
-  const pdf = await getDocument({ data: pdfData }).promise
-  const pages = []
-
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber)
-    const textContent = await page.getTextContent()
-    const pageText = textContent.items
-      .map((item) => ('str' in item ? item.str : ''))
-      .join(' ')
-      .trim()
-
-    if (pageText) {
-      pages.push(pageText)
-    }
-  }
-
-  return pages.join('\n\n')
-}
-
-async function extractUploadedDocumentText(file) {
-  const fileName = file.name.toLowerCase()
-  const fileType = file.type.toLowerCase()
-
-  if (fileType === 'application/pdf' || fileName.endsWith('.pdf')) {
-    return extractPdfText(file)
-  }
-
-  if (
-    fileType.startsWith('text/') ||
-    fileName.endsWith('.txt') ||
-    fileName.endsWith('.md')
-  ) {
-    return readFileAsText(file)
-  }
-
-  throw new Error('Unsupported file type. Please upload a PDF, TXT, or MD file.')
-}
-
-function parseAuditSummary(content) {
-  if (!content?.trim()) {
-    return { title: 'Audit Summary', items: [] }
-  }
-
-  const normalized = content.replace(/\r/g, '').trim()
-  const titleMatch = normalized.match(/^(Audit Summary:)/im)
-  const sectionMatches = [
-    ...normalized.matchAll(
-      /Point\s*(\d+)\s*\nRisk Level:\s*(.+?)\nIssue:\s*(.+?)\nContent:\s*([\s\S]*?)(?=\nPoint\s*\d+\s*\nRisk Level:|\s*$)/gi
-    ),
-  ]
-
-  const items = sectionMatches.map((match) => ({
-    point: Number(match[1]),
-    riskLevel: match[2].trim(),
-    heading: match[3].trim(),
-    description: match[4].trim(),
-  }))
-
-  if (items.length > 0) {
-    return {
-      title: titleMatch?.[1] || 'Audit Summary:',
-      items,
-    }
-  }
-
-  const lines = normalized
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-
-  return {
-    title: titleMatch?.[1] || 'Audit Summary:',
-    items: lines
-      .filter((line) => line.startsWith('-'))
-      .map((line, index) => ({
-        point: index + 1,
-        riskLevel: 'High',
-        heading: `Point ${index + 1}`,
-        description: line.replace(/^-+\s*/, ''),
-      })),
-  }
-}
-
-function extractAuditText(response) {
-  const choice = response?.choices?.[0]
-  const content = choice?.message?.content
-
-  if (typeof content === 'string') {
-    return content.trim()
-  }
-
-  if (Array.isArray(content)) {
-    const text = content
-      .map((part) => {
-        if (typeof part === 'string') {
-          return part
-        }
-
-        if (part?.type === 'text') {
-          return part.text || ''
-        }
-
-        return ''
-      })
-      .join('\n')
-      .trim()
-
-    if (text) {
-      return text
-    }
-  }
-
-  if (choice?.finish_reason === 'length') {
-    return 'Audit completed, but the response was cut off before the summary could be returned.'
-  }
-
-  return ''
-}
-
-function formatHistoryDate(value) {
-  try {
-    return new Date(value).toLocaleString()
-  } catch {
-    return 'Unknown time'
-  }
-}
-
-function getStorageArea() {
-  return chrome?.storage?.local
-}
-
-async function loadAuditHistory() {
-  const storage = getStorageArea()
-
-  if (!storage) {
-    return []
-  }
-
-  const result = await storage.get(HISTORY_STORAGE_KEY)
-  return Array.isArray(result?.[HISTORY_STORAGE_KEY]) ? result[HISTORY_STORAGE_KEY] : []
-}
-
-async function saveAuditHistory(history) {
-  const storage = getStorageArea()
-
-  if (!storage) {
-    return
-  }
-
-  await storage.set({ [HISTORY_STORAGE_KEY]: history })
-}
-
-const Home = () => {
+function Home() {
   const fileInputRef = useRef(null)
   const [activeTab, setActiveTab] = useState('Scan')
-  const [scanData, setScanData] = useState('')
-  const [auditResult, setAuditResult] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [scanLoading, setScanLoading] = useState(false)
-  const [uploadLoading, setUploadLoading] = useState(false)
-  const [scanStatus, setScanStatus] = useState('')
-  const [auditStatus, setAuditStatus] = useState('')
+  const [policyText, setPolicyText] = useState('')
   const [sourceLabel, setSourceLabel] = useState('')
-  const [historyItems, setHistoryItems] = useState([])
-  const parsedAudit = parseAuditSummary(auditResult)
-  const getRiskBadgeClasses = (riskLevel) => {
-    const normalized = riskLevel?.toLowerCase()
-
-    if (normalized === 'critical') {
-      return 'bg-rose-600 text-white'
-    }
-
-    if (normalized === 'medium') {
-      return 'bg-amber-100 text-amber-800'
-    }
-
-    if (normalized === 'low') {
-      return 'bg-emerald-100 text-emerald-800'
-    }
-
-    return 'bg-rose-100 text-rose-700'
-  }
+  const [auditResult, setAuditResult] = useState('')
+  const [resultTab, setResultTab] = useState('')
+  const [selectedHistoryId, setSelectedHistoryId] = useState('')
+  const [status, setStatus] = useState('')
+  const [statusTone, setStatusTone] = useState('neutral')
+  const [busy, setBusy] = useState(false)
+  const [history, setHistory] = useState([])
 
   useEffect(() => {
-    const hydrateHistory = async () => {
-      const storedHistory = await loadAuditHistory()
-      setHistoryItems(storedHistory)
-    }
-
-    hydrateHistory()
+    loadHistory().then(setHistory)
   }, [])
 
-  const persistAuditToHistory = async (auditText) => {
-    const nextEntry = {
+  function resetResult() {
+    setAuditResult('')
+    setResultTab('')
+    setSelectedHistoryId('')
+    setStatus('')
+  }
+
+  function refreshWorkspace() {
+    if (busy) return
+
+    setActiveTab('Scan')
+    setPolicyText('')
+    setSourceLabel('')
+    setAuditResult('')
+    setResultTab('')
+    setStatus('')
+    setStatusTone('neutral')
+  }
+
+  async function scanCurrentPage() {
+    setBusy(true)
+    resetResult()
+
+    try {
+      if (!extensionApi?.tabs || !extensionApi.scripting) {
+        throw new Error('This action is only available inside the browser extension.')
+      }
+
+      const [tab] = await extensionApi.tabs.query({ active: true, currentWindow: true })
+      const pdfUrl = getPdfUrl(tab.url)
+
+      if (pdfUrl) {
+        const text = await extractPdfUrl(pdfUrl)
+        setPolicyText(text.trim() ? text : '')
+        setSourceLabel(tab.title || 'PDF policy')
+        setResultTab('Scan')
+        setStatus(text.trim() ? 'PDF text is ready for audit.' : 'No readable text was found in this PDF.')
+        setStatusTone(text.trim() ? 'neutral' : 'error')
+        return
+      }
+
+      const [{ result }] = await extensionApi.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: extractPageText,
+      })
+
+      setPolicyText(result?.trim() || '')
+      setSourceLabel('Live page scan')
+      setResultTab('Scan')
+      setStatus(result?.trim() ? 'Page text is ready for audit.' : 'No readable policy text was found.')
+      setStatusTone(result?.trim() ? 'neutral' : 'error')
+    } catch (error) {
+      setPolicyText('')
+      setStatus(error?.message?.includes('download the PDF')
+        ? 'This PDF blocks direct reading. Download it and use Upload file instead.'
+        : 'Scan failed. Try again on a page with readable policy text.')
+      setStatusTone('error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function uploadDocument(event) {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    setBusy(true)
+    resetResult()
+
+    try {
+      const text = await extractDocumentText(file)
+      setPolicyText(text.trim() ? text : '')
+      setSourceLabel(file.name)
+      setResultTab('Upload Document')
+      setStatus(text.trim() ? `${file.name} is ready for audit.` : 'No readable text was found.')
+      setStatusTone(text.trim() ? 'neutral' : 'error')
+    } catch (error) {
+      setPolicyText('')
+      setSourceLabel('')
+      setStatus(error.message || 'Document upload failed.')
+      setStatusTone('error')
+    } finally {
+      event.target.value = ''
+      setBusy(false)
+    }
+  }
+
+  async function saveAudit(auditText) {
+    const entry = {
       id: crypto.randomUUID(),
       sourceLabel: sourceLabel || 'Unknown source',
       createdAt: new Date().toISOString(),
       auditResult: auditText,
     }
-
-    const existingHistory = await loadAuditHistory()
-    const nextHistory = [nextEntry, ...existingHistory].slice(0, 15)
-    setHistoryItems(nextHistory)
-    await saveAuditHistory(nextHistory)
+    const storedHistory = await loadHistory()
+    const existingHistory = storedHistory.length ? storedHistory : history
+    const nextHistory = [entry, ...existingHistory].slice(0, 15)
+    setHistory(nextHistory)
+    await saveHistory(nextHistory)
   }
 
-  const openHistoryItem = (entry) => {
-    setAuditResult(entry.auditResult)
-    setSourceLabel(entry.sourceLabel)
-    setAuditStatus('Loaded from history.')
-    setActiveTab('History')
-  }
-
-  const handleScan = async () => {
-    setActiveTab('Scan')
-    setScanLoading(true)
-    setScanStatus('')
-    setAuditStatus('')
-    setAuditResult('')
-
-    try {
-      const [activeTab] = await chrome.tabs.query({
-        active: true,
-        currentWindow: true,
-      })
-
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId: activeTab.id },
-        func: extractPageText,
-      })
-
-      setScanData(result || 'No text found.')
-      setSourceLabel('Live page scan')
-      setScanStatus(
-        result?.trim()
-          ? 'Scan complete. Policy text is ready for audit.'
-          : 'Scan complete, but no text was found on this page.'
-      )
-    } catch {
-      setScanData('Unable to scan this page.')
-      setScanStatus('Scan failed. Try again on a page with readable policy text.')
-    } finally {
-      setScanLoading(false)
-    }
-  }
-
-  const handleUploadClick = () => {
-    setActiveTab('Upload Document')
-    fileInputRef.current?.click()
-  }
-
-  const handleFileUpload = async (event) => {
-    const file = event.target.files?.[0]
-
-    if (!file) {
-      return
-    }
-
-    setUploadLoading(true)
-    setScanStatus('')
-    setAuditStatus('')
-    setAuditResult('')
-
-    try {
-      const extractedText = await extractUploadedDocumentText(file)
-
-      setScanData(extractedText || 'No text found in the uploaded document.')
-      setSourceLabel(file.name)
-      setScanStatus(
-        extractedText?.trim()
-          ? `Upload complete. ${file.name} is ready for audit.`
-          : `Upload complete, but no readable text was found in ${file.name}.`
-      )
-    } catch (error) {
-      setScanData('')
-      setSourceLabel('')
-      setScanStatus(error?.message || 'Document upload failed.')
-    } finally {
-      event.target.value = ''
-      setUploadLoading(false)
-    }
-  }
-
-  const handleAudit = async () => {
-    if (!scanData.trim()) return
+  async function auditPolicy() {
+    if (!policyText.trim()) return
 
     const apiKey = import.meta.env.VITE_REACT_APP_GROQ_API_KEY
-    const model = import.meta.env.VITE_REACT_APP_GROQ_MODEL || 'openai/gpt-oss-120b'
-    const prompt =
-      import.meta.env.VITE_REACT_APP_GROQ_PROMPT ||
-      'You are a policy auditor. Summarize important risks clearly.'
-
-    if (!apiKey) {
-      setAuditResult('Missing GROQ API key. Add VITE_REACT_APP_GROQ_API_KEY to your .env file.')
-      setAuditStatus('Audit could not start because the API key is missing.')
+    const proxyUrl = import.meta.env.VITE_REACT_APP_GROQ_PROXY_URL
+    if (!apiKey && !proxyUrl) {
+      setStatus('Configure VITE_REACT_APP_GROQ_PROXY_URL before auditing.')
+      setStatusTone('error')
       return
     }
 
-    setLoading(true)
-    setAuditResult('')
-    setAuditStatus('')
+    setBusy(true)
+    resetResult()
 
     try {
-      const groq = new Groq({
+      const response = await requestAudit({
         apiKey,
-        dangerouslyAllowBrowser: true,
+        model: import.meta.env.VITE_REACT_APP_GROQ_MODEL || 'openai/gpt-oss-120b',
+        prompt: import.meta.env.VITE_REACT_APP_GROQ_PROMPT || 'You are a policy auditor. Summarize important risks clearly.',
+        policyText,
       })
+      const text = extractAuditText(response)
 
-      const response = await groq.chat.completions.create({
-        model,
-        messages: [
-          {
-            role: 'system',
-            content: prompt,
-          },
-          {
-            role: 'user',
-            content: `POLICY TEXT TO AUDIT:\n${scanData}`,
-          },
-        ],
-        temperature: 0.1,
-        max_completion_tokens: 4096,
-      })
-
-      const auditText = extractAuditText(response)
-
-      if (auditText) {
-        setAuditResult(auditText)
-        setAuditStatus('Audit complete. Results are shown below.')
-        await persistAuditToHistory(auditText)
-      } else {
-        setAuditStatus('Audit finished, but no readable summary was returned.')
-      }
+      if (!text) throw new Error('The audit returned no readable summary.')
+      setAuditResult(text)
+      setResultTab(activeTab)
+      setStatus('Audit complete. These are the three highest-impact clauses found.')
+      setStatusTone('neutral')
+      await saveAudit(text)
     } catch (error) {
-      setAuditResult(error?.message || 'Audit failed.')
-      setAuditStatus('Audit failed. Please try again.')
-      console.error('Audit failed:', error)
+      setStatus(error.message || 'Audit failed. Please try again.')
+      setStatusTone('error')
     } finally {
-      setLoading(false)
+      setBusy(false)
     }
   }
 
-  return (
-    <section className='min-h-100 w-150 bg-[radial-gradient(circle_at_top,#fff7ed,#e2e8f0_55%,#cbd5e1)] p-4 text-slate-900'>
-      <div className='flex flex-col gap-4'>
-        <div className='text-center'>
-          <h3 className='text-2xl font-semibold tracking-tight'>AgreeWise</h3>
-          <p className='text-sm text-slate-600'>Know what you agree to</p>
-        </div>
+  async function clearHistory() {
+    setHistory([])
+    setAuditResult('')
+    setResultTab('')
+    setSelectedHistoryId('')
+    setPolicyText('')
+    setSourceLabel('')
+    await saveHistory([])
+    setStatus('History and the open result were cleared.')
+    setStatusTone('neutral')
+  }
 
-        <div className='grid grid-cols-3 gap-2 rounded-2xl border border-slate-200 bg-white/70 p-2 shadow-sm'>
-          {TAB_OPTIONS.map((tab) => (
-            <button
-              key={tab}
-              type='button'
-              onClick={() => setActiveTab(tab)}
-              className={`rounded-xl px-3 py-2 text-sm font-medium transition ${
-                activeTab === tab
-                  ? 'bg-slate-900 text-white'
-                  : 'bg-transparent text-slate-700 hover:bg-slate-100'
-              }`}
-            >
-              {tab}
-            </button>
-          ))}
-        </div>
+  function openHistory(entry) {
+    setAuditResult(entry.auditResult)
+    setResultTab('History')
+    setSelectedHistoryId(entry.id)
+    setSourceLabel(entry.sourceLabel)
+    setActiveTab('History')
+    setStatus('Loaded from history.')
+    setStatusTone('neutral')
+  }
+
+  const hasPolicy = Boolean(policyText.trim())
+
+  return (
+    <main className='min-h-100 w-95 bg-[#f5f6f8] text-slate-900'>
+      <Header onRefresh={refreshWorkspace} disabled={busy} />
+      <div className='flex flex-col gap-4 p-4'>
+        <section>
+          <p className='text-[11px] font-bold uppercase tracking-[0.18em] text-[#a06a21]'>
+            {activeTab === 'History' ? 'Saved reviews' : 'Privacy policy reader'}
+          </p>
+          <h2 className='mt-1 text-2xl font-bold tracking-tight text-[#17212b]'>
+            {activeTab === 'History' ? 'Your policy history.' : 'Know before you agree.'}
+          </h2>
+          <p className='mt-1 text-sm leading-5 text-slate-600'>
+            {activeTab === 'History'
+              ? 'Open a previous three-clause review or clear your saved results.'
+              : 'We find the three clauses most likely to affect you.'}
+          </p>
+        </section>
+        <Navigation activeTab={activeTab} onChange={setActiveTab} />
 
         {activeTab === 'Scan' && (
-          <button
-            type='button'
-            onClick={handleScan}
-            disabled={scanLoading}
-            className='rounded-xl bg-slate-900 px-4 py-2 font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60'
-          >
-            {scanLoading ? 'Scanning...' : 'Scan Current Page'}
-          </button>
-        )}
-
-        <input
-          ref={fileInputRef}
-          type='file'
-          accept='.pdf,.txt,.md,text/plain,application/pdf'
-          onChange={handleFileUpload}
-          className='hidden'
-        />
-
-        {activeTab === 'Upload Document' && (
-          <button
-            type='button'
-            onClick={handleUploadClick}
-            disabled={uploadLoading}
-            className='rounded-xl border border-slate-300 bg-white px-4 py-2 font-medium text-slate-900 shadow-sm transition hover:border-slate-400 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60'
-          >
-            {uploadLoading ? 'Uploading...' : 'Choose Document'}
-          </button>
-        )}
-
-        {activeTab === 'History' && (
-          <div className='space-y-3'>
-            {historyItems.length > 0 ? (
-              historyItems.map((entry) => {
-                const entrySummary = parseAuditSummary(entry.auditResult)
-                return (
-                  <button
-                    key={entry.id}
-                    type='button'
-                    onClick={() => openHistoryItem(entry)}
-                    className='w-full rounded-2xl border border-slate-200 bg-white/90 p-4 text-left shadow-sm transition hover:border-slate-300 hover:bg-white'
-                  >
-                    <div className='flex items-start justify-between gap-3'>
-                      <div>
-                        <div className='text-sm font-semibold text-slate-900'>{entry.sourceLabel}</div>
-                        <div className='mt-1 text-xs text-slate-500'>
-                          {formatHistoryDate(entry.createdAt)}
-                        </div>
-                      </div>
-                      <span className='rounded-full bg-slate-100 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-600'>
-                        {entrySummary.items.length || 3} points
-                      </span>
-                    </div>
-                    <div className='mt-3 text-sm text-slate-700'>
-                      {entrySummary.items[0]?.heading || 'Saved audit result'}
-                    </div>
-                  </button>
-                )
-              })
-            ) : (
-              <div className='rounded-2xl border border-dashed border-slate-300 bg-white/70 p-5 text-sm text-slate-600'>
-                No audit history yet. Run an audit from Scan or Upload Document to save it here.
-              </div>
-            )}
-          </div>
-        )}
-
-        {scanStatus && (
-          <div className='rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800'>
-            {scanStatus}
-          </div>
-        )}
-
-        {sourceLabel && (
-          <div className='rounded-xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-700'>
-            Source: {sourceLabel}
-          </div>
-        )}
-
-        <button
-          onClick={handleAudit}
-          disabled={
-            activeTab === 'History' ||
-            loading ||
-            scanLoading ||
-            uploadLoading ||
-            !scanData.trim() ||
-            scanData === 'Unable to scan this page.'
-          }
-          className='rounded-xl border border-slate-300 bg-white px-4 py-2 font-medium text-slate-900 shadow-sm transition hover:border-slate-400 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60'
-        >
-          {loading ? 'Auditing...' : 'Audit Policy'}
-        </button>
-
-        {auditStatus && (
-          <div className='rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900'>
-            {auditStatus}
-          </div>
-        )}
-
-        {auditResult && (
-          <div className='mt-2 overflow-hidden rounded-2xl border border-amber-200 bg-white/90 shadow-lg shadow-slate-300/40 backdrop-blur'>
-            <div className='border-b border-amber-100 bg-linear-to-r from-amber-50 via-orange-50 to-white px-4 py-4'>
-              <div className='flex items-center gap-3'>
-                <div className='flex h-10 w-10 items-center justify-center rounded-full bg-amber-500 text-sm font-bold text-white'>
-                  !
-                </div>
-                <div>
-                  <h4 className='text-lg font-semibold text-slate-900'>{parsedAudit.title}</h4>
-                  <p className='text-sm text-slate-600'>
-                    Key privacy and compliance concerns detected in the scanned policy.
-                  </p>
-                </div>
+          <section className='rounded-xl border border-slate-200 bg-white p-4 shadow-sm'>
+            <div className='flex items-start gap-3'>
+              <span className='flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#e9eef3] text-sm font-bold text-[#17212b]'>1</span>
+              <div>
+                <h3 className='font-bold text-[#17212b]'>Choose your policy source</h3>
+                <p className='mt-1 text-xs leading-5 text-slate-500'>Scan the page you are reading or import a saved document.</p>
               </div>
             </div>
-
-            {parsedAudit.items.length > 0 ? (
-              <div className='space-y-3 p-4'>
-                {parsedAudit.items.map((item, index) => (
-                  <article
-                    key={`${item.point || index}-${item.heading}-${index}`}
-                    className='rounded-xl border border-slate-200 bg-slate-50/80 p-4'
-                  >
-                    <div className='mb-3 flex items-center justify-between gap-3'>
-                      <span className='text-xs font-semibold uppercase tracking-[0.16em] text-slate-500'>
-                        Point {item.point || index + 1}
-                      </span>
-                      <span
-                        className={`rounded-full px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${getRiskBadgeClasses(item.riskLevel)}`}
-                      >
-                        {item.riskLevel || 'High'}
-                      </span>
-                    </div>
-                    <h5 className='text-base font-semibold text-slate-900'>{item.heading}</h5>
-                    <p className='mt-2 text-sm leading-6 text-slate-700'>{item.description}</p>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <div className='p-4'>
-                <div className='rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-6 text-slate-700 whitespace-pre-wrap'>
-                  {auditResult}
-                </div>
-              </div>
-            )}
-          </div>
+            <button type='button' onClick={scanCurrentPage} disabled={busy} className='mt-4 w-full rounded-lg bg-[#17212b] px-4 py-3 text-sm font-bold text-white transition hover:bg-[#263746] disabled:cursor-not-allowed disabled:opacity-60'>
+              {busy ? 'Reading page...' : 'Scan current page'}
+            </button>
+            <button type='button' onClick={() => setActiveTab('Upload Document')} className='mt-2 w-full rounded-lg border border-slate-300 px-4 py-2.5 text-xs font-bold text-slate-700 transition hover:bg-slate-50'>
+              Or upload a PDF / TXT / MD
+            </button>
+          </section>
         )}
+
+        {activeTab === 'Upload Document' && (
+          <section className='rounded-xl border border-dashed border-slate-400 bg-white p-4'>
+            <p className='text-[10px] font-bold uppercase tracking-[0.18em] text-[#a06a21]'>Import policy</p>
+            <h2 className='mt-1 text-lg font-bold text-[#17212b]'>Choose a document</h2>
+            <p className='mt-1 text-sm leading-5 text-slate-600'>PDF, TXT, or Markdown files are supported.</p>
+            <button type='button' onClick={() => fileInputRef.current?.click()} disabled={busy} className='mt-4 w-full rounded-lg bg-[#17212b] px-4 py-3 text-sm font-bold text-white transition hover:bg-[#263746] disabled:cursor-not-allowed disabled:opacity-60'>
+              {busy ? 'Reading document...' : 'Choose a document'}
+            </button>
+          </section>
+        )}
+
+        <input ref={fileInputRef} type='file' accept='.pdf,.txt,.md,text/plain,application/pdf' onChange={uploadDocument} className='hidden' />
+
+        {status && <StatusMessage tone={statusTone}>{status}</StatusMessage>}
+        {activeTab === 'History' ? (
+          <HistoryList items={history} onOpen={openHistory} onClear={clearHistory} />
+        ) : (
+          <>
+            <SourcePanel sourceLabel={sourceLabel} text={policyText} />
+          </>
+        )}
+
+        {activeTab !== 'History' && hasPolicy && (
+          <section className='rounded-xl border border-[#e7c98b] bg-[#fffaf0] p-4'>
+            <div className='flex items-center justify-between gap-3'>
+              <div>
+                <p className='text-[11px] font-bold uppercase tracking-[0.18em] text-[#a06a21]'>Step 2 / understand</p>
+                <p className='mt-1 text-sm font-semibold text-[#17212b]'>Policy captured. Find the three key clauses.</p>
+              </div>
+              <button type='button' onClick={auditPolicy} disabled={busy} className='rounded-lg bg-[#e29a28] px-3 py-3 text-xs font-black text-[#17212b] transition hover:bg-[#f0b54b] disabled:cursor-not-allowed disabled:opacity-60'>
+                {busy ? 'Analyzing...' : 'Analyze'}
+              </button>
+            </div>
+          </section>
+        )}
+
+        {((activeTab !== 'History' && resultTab === activeTab) ||
+          (activeTab === 'History' && selectedHistoryId)) && <AuditResults result={auditResult} />}
       </div>
-    </section>
+    </main>
   )
 }
 
