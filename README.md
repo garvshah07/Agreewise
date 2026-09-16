@@ -99,6 +99,14 @@ To test the extension in Chrome or Edge:
 4. Select the build folder in this project
 5. Open the extension and scan a policy page or upload a document
 
+## Future Enhancements
+
+1. Authentication & Authorization
+2. Backend integration
+3. doc & docx file support 
+4. Convert genrated result into pdf & share
+5. Large document policy analysis
+
 ## Demo and Submission Notes
 
 - This project is designed as a local browser extension demo.
