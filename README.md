@@ -103,9 +103,10 @@ To test the extension in Chrome or Edge:
 
 1. Authentication & Authorization
 2. Backend integration
-3. doc & docx file support 
+3. doc & docx file support
 4. Convert genrated result into pdf & share
 5. Large document policy analysis
+6. Other browser compatible
 
 ## Demo and Submission Notes
 
@@ -117,12 +118,6 @@ To test the extension in Chrome or Edge:
 - Project Name: AgreeWise
 - Category: Policy review / privacy awareness / browser extension
 - Submission Type: GitHub repository
-
-## Presentation
-
-The project presentation is available here:
-
-- 
 
 ## License
 
