@@ -49,7 +49,7 @@ The application is structured as a lightweight browser extension popup with the 
 ### 1. Clone the repository
 
 ```bash
-git clone <your-github-repo-link>
+git clone https://github.com/garvshah07/Agreewise
 cd Agreewise
 ```
 
